@@ -1,0 +1,14 @@
+{
+  "checkpoint_refresh_sec": 2.0,
+  "loss_terms": {
+    "pelvis_tilt": true,
+    "foot_pin": true,
+    "limb_radius": true
+  },
+  "experiment": {
+    "checkpoint_dir": "checkpoints/live",
+    "batch_size": 2048,
+    "lr": 0.003,
+    "seed": 0
+  }
+}
