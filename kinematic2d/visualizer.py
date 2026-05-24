@@ -60,8 +60,12 @@ LOSS_WIDGET_MARGIN = 12
 SLIDE_HISTORY_MAX = 600
 SIM_STEP_SEC = 1.0 / TARGET_HZ
 SETTINGS_PANEL_W = 380
-SETTINGS_PANEL_BASE_H = 200
+SETTINGS_REFRESH_LABEL_DY = 38
+SETTINGS_REFRESH_ROW_DY = 64
+SETTINGS_TERMS_LABEL_DY = 108
+SETTINGS_TERMS_ROW_DY = 132
 SETTINGS_LOSS_TERM_ROW_H = 36
+SETTINGS_FOOTER_H = 56
 REFRESH_STEP_SEC = 1.0
 # Keep pygame draw coords in a safe int range when limbs diverge far from root.
 SCREEN_COORD_CLAMP = 500_000
@@ -133,7 +137,7 @@ class Visualizer:
             self.experiment_runner.start()
 
     def _settings_panel_height(self) -> int:
-        return SETTINGS_PANEL_BASE_H + len(LOSS_TERMS) * SETTINGS_LOSS_TERM_ROW_H
+        return SETTINGS_TERMS_ROW_DY + len(LOSS_TERMS) * SETTINGS_LOSS_TERM_ROW_H + SETTINGS_FOOTER_H
 
     def _layout_settings_panel(self) -> None:
         panel_h = self._settings_panel_height()
@@ -143,12 +147,12 @@ class Visualizer:
             SETTINGS_PANEL_W,
             panel_h,
         )
-        row_y = self.settings_panel.y + 88
+        row_y = self.settings_panel.y + SETTINGS_REFRESH_ROW_DY
         self.refresh_minus_btn = pygame.Rect(self.settings_panel.x + 36, row_y, 44, 34)
         self.refresh_plus_btn = pygame.Rect(self.settings_panel.right - 80, row_y, 44, 34)
 
         self.loss_term_toggle_btns = {}
-        terms_top = self.settings_panel.y + 128
+        terms_top = self.settings_panel.y + SETTINGS_TERMS_ROW_DY
         for i, spec in enumerate(LOSS_TERMS):
             row_y = terms_top + i * SETTINGS_LOSS_TERM_ROW_H
             self.loss_term_toggle_btns[spec.key] = pygame.Rect(
@@ -158,7 +162,7 @@ class Visualizer:
                 28,
             )
 
-        btn_y = self.settings_panel.bottom - 52
+        btn_y = self.settings_panel.bottom - 44
         self.settings_save_btn = pygame.Rect(self.settings_panel.x + 48, btn_y, 120, 34)
         self.settings_close_btn = pygame.Rect(self.settings_panel.right - 168, btn_y, 120, 34)
 
@@ -550,7 +554,7 @@ class Visualizer:
 
         mouse_pos = pygame.mouse.get_pos()
         label = self.font_small.render("Loss / NN refresh interval (seconds)", True, UI_TEXT)
-        self.screen.blit(label, (panel.x + 16, panel.y + 52))
+        self.screen.blit(label, (panel.x + 16, panel.y + SETTINGS_REFRESH_LABEL_DY))
 
         self._draw_button(self.refresh_minus_btn, "-", self.refresh_minus_btn.collidepoint(mouse_pos))
         self._draw_button(self.refresh_plus_btn, "+", self.refresh_plus_btn.collidepoint(mouse_pos))
@@ -560,10 +564,10 @@ class Visualizer:
         self.screen.blit(value, value_rect)
 
         terms_label = self.font_small.render("Training loss terms (New Run)", True, UI_TEXT)
-        self.screen.blit(terms_label, (panel.x + 16, panel.y + 108))
+        self.screen.blit(terms_label, (panel.x + 16, panel.y + SETTINGS_TERMS_LABEL_DY))
 
         for i, spec in enumerate(LOSS_TERMS):
-            row_y = panel.y + 128 + i * SETTINGS_LOSS_TERM_ROW_H
+            row_y = panel.y + SETTINGS_TERMS_ROW_DY + i * SETTINGS_LOSS_TERM_ROW_H
             enabled = self._draft_loss_terms.get(spec.key, True)
             name_surf = self.font_tiny.render(spec.label, True, UI_TEXT)
             self.screen.blit(name_surf, (panel.x + 16, row_y + 6))
