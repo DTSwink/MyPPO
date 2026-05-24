@@ -6,17 +6,17 @@ import argparse
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the 2D kinematic visualizer.")
     parser.add_argument(
-        "--no-reload",
+        "--reload",
         action="store_true",
-        help="Disable auto-restart on code changes.",
+        help="Auto-restart the visualizer when Python source files change.",
     )
     args = parser.parse_args()
 
-    if args.no_reload:
-        from kinematic2d.visualizer import main
-
-        main()
-    else:
+    if args.reload:
         from kinematic2d.dev_reload import run_with_reload
 
         run_with_reload()
+    else:
+        from kinematic2d.visualizer import main
+
+        main()

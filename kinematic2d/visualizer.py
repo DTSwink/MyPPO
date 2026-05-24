@@ -11,13 +11,21 @@ import pygame
 
 from kinematic2d.agent import MLPAgent
 from kinematic2d.checkpoint import load_checkpoint, load_loss_history
-from kinematic2d.loss_terms import LOSS_TERMS
+from kinematic2d.loss_terms import LOSS_TERMS, MAX_LOSS_COEFF, MIN_LOSS_COEFF, normalize_loss_coeffs
 from kinematic2d.settings import (
+    MAX_AUTOREGRESSIVE_WINDOW,
     MAX_CHECKPOINT_REFRESH_SEC,
+    MIN_AUTOREGRESSIVE_WINDOW,
     MIN_CHECKPOINT_REFRESH_SEC,
     SettingsStore,
 )
-from kinematic2d.state import Simulation
+from kinematic2d import viz_shutdown
+from kinematic2d.state import (
+    Simulation,
+    agent_input_finite,
+    agent_output_finite,
+    limb_state_finite,
+)
 from kinematic2d.trajectory import TRAJECTORY_SPEED, forward_constant_trajectory
 from kinematic2d.transforms import Transform2D, local_to_global, rotation_matrix
 
@@ -44,29 +52,45 @@ SLIDE_LINE = (255, 180, 80)
 SLIDE_FILL = (120, 70, 30)
 RADIUS_LINE = (190, 140, 255)
 RADIUS_FILL = (70, 45, 110)
+STRIDE_LINE = (80, 255, 200)
+STRIDE_FILL = (30, 100, 80)
 LOSS_TERM_CHART_COLORS: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
     "pelvis_tilt": (LOSS_LINE, LOSS_FILL),
     "foot_pin": (SLIDE_LINE, SLIDE_FILL),
     "limb_radius": (RADIUS_LINE, RADIUS_FILL),
+    "foot_stride": (STRIDE_LINE, STRIDE_FILL),
 }
 TARGET_HZ = 30
 LOSS_WIDGET_W = 404
 LOSS_WIDGET_H = 198
 LOSS_GRID_COLS = 2
-LOSS_GRID_ROWS = 2
 SLIDE_WIDGET_W = 240
 SLIDE_WIDGET_H = 130
 LOSS_WIDGET_MARGIN = 12
+BOTTOM_BAR_H = 48
+BUTTON_H = 34
 SLIDE_HISTORY_MAX = 600
 SIM_STEP_SEC = 1.0 / TARGET_HZ
-SETTINGS_PANEL_W = 380
-SETTINGS_REFRESH_LABEL_DY = 38
-SETTINGS_REFRESH_ROW_DY = 64
-SETTINGS_TERMS_LABEL_DY = 108
-SETTINGS_TERMS_ROW_DY = 132
-SETTINGS_LOSS_TERM_ROW_H = 36
+SETTINGS_PANEL_W = 480
+SETTINGS_TITLE_DY = 14
+SETTINGS_LABEL_LINE_H = 22
+SETTINGS_CTRL_H = 34
+SETTINGS_SECTION_GAP = 14
+SETTINGS_TERMS_HEADER_H = 20
+SETTINGS_REFRESH_LABEL_DY = 36
+SETTINGS_REFRESH_ROW_DY = SETTINGS_REFRESH_LABEL_DY + SETTINGS_LABEL_LINE_H + 4
+SETTINGS_AR_LABEL_DY = SETTINGS_REFRESH_ROW_DY + SETTINGS_CTRL_H + SETTINGS_SECTION_GAP
+SETTINGS_AR_ROW_DY = SETTINGS_AR_LABEL_DY + SETTINGS_LABEL_LINE_H + 4
+SETTINGS_TERMS_HEADER_DY = SETTINGS_AR_ROW_DY + SETTINGS_CTRL_H + SETTINGS_SECTION_GAP
+SETTINGS_TERMS_ROW_DY = SETTINGS_TERMS_HEADER_DY + SETTINGS_TERMS_HEADER_H + 4
+SETTINGS_LOSS_TERM_ROW_H = 52
 SETTINGS_FOOTER_H = 56
 REFRESH_STEP_SEC = 1.0
+COEFF_STEP_FACTOR = 1.25
+DEFAULT_PPM = 280.0
+MIN_PPM = 60.0
+MAX_PPM = 1400.0
+ZOOM_STEP = 1.12
 # Keep pygame draw coords in a safe int range when limbs diverge far from root.
 SCREEN_COORD_CLAMP = 500_000
 
@@ -76,7 +100,7 @@ class Visualizer:
         self,
         width: int = 960,
         height: int = 720,
-        pixels_per_meter: float = 280.0,
+        pixels_per_meter: float = DEFAULT_PPM,
         seed: int | None = None,
         training_mode: bool = False,
         checkpoint_dir: Path | str | None = None,
@@ -87,6 +111,9 @@ class Visualizer:
         self.width = width
         self.height = height
         self.ppm = pixels_per_meter
+        self._default_ppm = pixels_per_meter
+        self._view_offset_x = 0.0
+        self._view_offset_y = 0.0
         self.seed = seed
 
         self.screen = pygame.display.set_mode((width, height))
@@ -100,8 +127,12 @@ class Visualizer:
         self.settings_store = SettingsStore()
         self.show_settings = False
         self._draft_refresh_sec = self.settings_store.checkpoint_refresh_sec()
+        self._draft_ar_window = self.settings_store.autoregressive_window()
         self._draft_loss_terms = self.settings_store.loss_terms_enabled()
+        self._draft_loss_coeffs = self.settings_store.loss_coeffs()
         self.loss_term_toggle_btns: dict[str, pygame.Rect] = {}
+        self.loss_term_coeff_minus_btns: dict[str, pygame.Rect] = {}
+        self.loss_term_coeff_plus_btns: dict[str, pygame.Rect] = {}
 
         self.training_mode = training_mode
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
@@ -121,16 +152,18 @@ class Visualizer:
         self.sim = Simulation(roots=self.roots)
         self.agent = MLPAgent(seed=seed)
 
+        viz_shutdown.clear()
         self.running = True
+        self._user_requested_exit = False
         self.paused = False
         self.show_trajectory = False
         self._sim_steps_this_second = 0
         self._sim_rate = 0.0
         self._rate_timer_ms = 0
 
-        self.reset_button = pygame.Rect(width // 2 - 60, height - 48, 120, 34)
-        self.settings_button = pygame.Rect(width // 2 - 190, height - 48, 120, 34)
-        self.new_run_button = pygame.Rect(width // 2 + 70, height - 48, 120, 34)
+        self.reset_button = pygame.Rect(width // 2 - 60, height - BOTTOM_BAR_H, 120, BUTTON_H)
+        self.settings_button = pygame.Rect(width // 2 - 190, height - BOTTOM_BAR_H, 120, BUTTON_H)
+        self.new_run_button = pygame.Rect(width // 2 + 70, height - BOTTOM_BAR_H, 120, BUTTON_H)
         self._layout_settings_panel()
 
         if self.experiment_runner is not None:
@@ -148,17 +181,35 @@ class Visualizer:
             panel_h,
         )
         row_y = self.settings_panel.y + SETTINGS_REFRESH_ROW_DY
-        self.refresh_minus_btn = pygame.Rect(self.settings_panel.x + 36, row_y, 44, 34)
-        self.refresh_plus_btn = pygame.Rect(self.settings_panel.right - 80, row_y, 44, 34)
+        self.refresh_minus_btn = pygame.Rect(self.settings_panel.x + 36, row_y, 44, SETTINGS_CTRL_H)
+        self.refresh_plus_btn = pygame.Rect(self.settings_panel.right - 80, row_y, 44, SETTINGS_CTRL_H)
+
+        ar_row_y = self.settings_panel.y + SETTINGS_AR_ROW_DY
+        self.ar_window_minus_btn = pygame.Rect(self.settings_panel.x + 36, ar_row_y, 44, SETTINGS_CTRL_H)
+        self.ar_window_plus_btn = pygame.Rect(self.settings_panel.right - 80, ar_row_y, 44, SETTINGS_CTRL_H)
 
         self.loss_term_toggle_btns = {}
+        self.loss_term_coeff_minus_btns = {}
+        self.loss_term_coeff_plus_btns = {}
         terms_top = self.settings_panel.y + SETTINGS_TERMS_ROW_DY
         for i, spec in enumerate(LOSS_TERMS):
             row_y = terms_top + i * SETTINGS_LOSS_TERM_ROW_H
+            self.loss_term_coeff_minus_btns[spec.key] = pygame.Rect(
+                self.settings_panel.x + 188,
+                row_y + 8,
+                28,
+                28,
+            )
+            self.loss_term_coeff_plus_btns[spec.key] = pygame.Rect(
+                self.settings_panel.x + 268,
+                row_y + 8,
+                28,
+                28,
+            )
             self.loss_term_toggle_btns[spec.key] = pygame.Rect(
-                self.settings_panel.right - 88,
-                row_y,
-                72,
+                self.settings_panel.right - 72,
+                row_y + 8,
+                56,
                 28,
             )
 
@@ -180,8 +231,10 @@ class Visualizer:
         """Top-down view: translate only, no camera rotation."""
         if not (math.isfinite(world_x) and math.isfinite(world_y)):
             return self.width // 2, self.height // 2
-        sx = self.width * 0.5 + (world_x - camera_root.x) * self.ppm
-        sy = self.height * 0.5 - (world_y - camera_root.y) * self.ppm
+        cam_x = camera_root.x + self._view_offset_x
+        cam_y = camera_root.y + self._view_offset_y
+        sx = self.width * 0.5 + (world_x - cam_x) * self.ppm
+        sy = self.height * 0.5 - (world_y - cam_y) * self.ppm
         if not (math.isfinite(sx) and math.isfinite(sy)):
             return self.width // 2, self.height // 2
         sx = max(-SCREEN_COORD_CLAMP, min(SCREEN_COORD_CLAMP, sx))
@@ -193,6 +246,44 @@ class Visualizer:
             -margin <= px < self.width + margin
             and -margin <= py < self.height + margin
         )
+
+    def _scroll_zoom_allowed(self, pos: tuple[int, int]) -> bool:
+        if self.show_settings:
+            return False
+        x, y = pos
+        if y >= self.height - BOTTOM_BAR_H:
+            return False
+        bottom = self.height - BOTTOM_BAR_H - LOSS_WIDGET_MARGIN
+        if y >= bottom - SLIDE_WIDGET_H:
+            if x <= SLIDE_WIDGET_W + LOSS_WIDGET_MARGIN * 2:
+                return False
+            if self._experiment_active() and x >= self.width - LOSS_WIDGET_W - LOSS_WIDGET_MARGIN * 2:
+                return False
+        return True
+
+    def _adjust_zoom(self, direction: int, focus: tuple[int, int]) -> None:
+        if direction == 0:
+            return
+        mx, my = focus
+        camera_root = self.sim.current_root
+        cam_x = camera_root.x + self._view_offset_x
+        cam_y = camera_root.y + self._view_offset_y
+        world_x = cam_x + (mx - self.width / 2) / self.ppm
+        world_y = cam_y - (my - self.height / 2) / self.ppm
+
+        factor = ZOOM_STEP if direction > 0 else 1.0 / ZOOM_STEP
+        new_ppm = max(MIN_PPM, min(MAX_PPM, self.ppm * factor))
+        if math.isclose(new_ppm, self.ppm):
+            return
+        self.ppm = new_ppm
+
+        self._view_offset_x = world_x - camera_root.x - (mx - self.width / 2) / self.ppm
+        self._view_offset_y = world_y - camera_root.y + (my - self.height / 2) / self.ppm
+
+    def _reset_view(self) -> None:
+        self.ppm = self._default_ppm
+        self._view_offset_x = 0.0
+        self._view_offset_y = 0.0
 
     def draw_grid(self, camera_root: Transform2D, spacing: float = 0.25) -> None:
         half_w = self.width / self.ppm / 2.0 + spacing
@@ -317,9 +408,9 @@ class Visualizer:
 
         status = "PAUSED" if self.paused else ("DONE" if self.sim.finished else "RUNNING")
         help_line = (
-            "Space: pause  |  R: reset  |  N: new run  |  T: path  |  S: settings"
+            "Space: pause  |  R: reset  |  N: new run  |  T: path  |  S: settings  |  Scroll: zoom"
             if self._experiment_active()
-            else "Space: pause  |  R: reset  |  N: start exp  |  T: path  |  S: settings"
+            else "Space: pause  |  R: reset  |  N: start exp  |  T: path  |  S: settings  |  Scroll: zoom"
         )
         lines = [
             f"Frame {self.sim.frame_index} / {len(self.roots) - 1}  [{status}]",
@@ -406,18 +497,19 @@ class Visualizer:
             pygame.draw.polygon(self.screen, fill_color, fill_points)
             pygame.draw.lines(self.screen, line_color, False, points, 1)
 
+    def _bottom_widget_y(self, widget_h: int) -> int:
+        """Place chart widgets above the bottom button row."""
+        return self.height - widget_h - BOTTOM_BAR_H - LOSS_WIDGET_MARGIN
+
     def draw_loss_widget(self) -> None:
         rect = pygame.Rect(
             self.width - LOSS_WIDGET_W - LOSS_WIDGET_MARGIN,
-            self.height - LOSS_WIDGET_H - LOSS_WIDGET_MARGIN,
+            self._bottom_widget_y(LOSS_WIDGET_H),
             LOSS_WIDGET_W,
             LOSS_WIDGET_H,
         )
         pygame.draw.rect(self.screen, LOSS_PANEL_BG, rect, border_radius=8)
         pygame.draw.rect(self.screen, LOSS_PANEL_BORDER, rect, 1, border_radius=8)
-
-        title = self.font_small.render("Training losses", True, UI_TEXT)
-        self.screen.blit(title, (rect.x + 10, rect.y + 6))
 
         if not math.isnan(self._train_loss):
             header = f"step {self._train_step}  total {self._train_loss:.4f}"
@@ -427,16 +519,24 @@ class Visualizer:
             header = ""
         if header:
             header_surf = self.font_tiny.render(header, True, UI_TEXT)
-            self.screen.blit(header_surf, (rect.x + 10, rect.y + 24))
+            self.screen.blit(header_surf, (rect.x + 10, rect.y + 8))
 
-        grid = pygame.Rect(rect.x + 8, rect.y + 42, rect.width - 16, rect.height - 50)
-        cell_w = grid.width // LOSS_GRID_COLS
-        cell_h = grid.height // LOSS_GRID_ROWS
+        grid = pygame.Rect(rect.x + 8, rect.y + 26, rect.width - 16, rect.height - 34)
+        active_terms = self._enabled_loss_terms()
+        if not active_terms:
+            empty = self.font_tiny.render("No active loss terms", True, UI_TEXT)
+            self.screen.blit(empty, (grid.x + 8, grid.y + 8))
+            return
+
+        grid_cols = 1 if len(active_terms) == 1 else LOSS_GRID_COLS
+        grid_rows = max(1, (len(active_terms) + grid_cols - 1) // grid_cols)
+        cell_w = grid.width // grid_cols
+        cell_h = grid.height // grid_rows
         pad = 4
 
-        for idx, spec in enumerate(LOSS_TERMS):
-            col = idx % LOSS_GRID_COLS
-            row = idx // LOSS_GRID_COLS
+        for idx, spec in enumerate(active_terms):
+            col = idx % grid_cols
+            row = idx // grid_cols
             cell = pygame.Rect(
                 grid.x + col * cell_w + pad,
                 grid.y + row * cell_h + pad,
@@ -458,7 +558,7 @@ class Visualizer:
     def draw_slide_widget(self) -> None:
         rect = pygame.Rect(
             LOSS_WIDGET_MARGIN,
-            self.height - SLIDE_WIDGET_H - LOSS_WIDGET_MARGIN,
+            self._bottom_widget_y(SLIDE_WIDGET_H),
             SLIDE_WIDGET_W,
             SLIDE_WIDGET_H,
         )
@@ -532,10 +632,10 @@ class Visualizer:
         self.draw_pelvis(camera_root, self.sim.current_limbs.pelvis, camera_root)
         self.draw_root_cross(camera_root, camera_root)
 
-        self.draw_ui()
         self.draw_slide_widget()
         if self._experiment_active():
             self.draw_loss_widget()
+        self.draw_ui()
         if self.show_settings:
             self.draw_settings_panel()
         pygame.display.flip()
@@ -563,14 +663,40 @@ class Visualizer:
         value_rect = value.get_rect(center=(panel.centerx, self.refresh_minus_btn.centery))
         self.screen.blit(value, value_rect)
 
-        terms_label = self.font_small.render("Training loss terms (New Run)", True, UI_TEXT)
-        self.screen.blit(terms_label, (panel.x + 16, panel.y + SETTINGS_TERMS_LABEL_DY))
+        ar_label = self.font_small.render("Autoregressive window (K)", True, UI_TEXT)
+        self.screen.blit(ar_label, (panel.x + 16, panel.y + SETTINGS_AR_LABEL_DY))
+        self._draw_button(
+            self.ar_window_minus_btn,
+            "-",
+            self.ar_window_minus_btn.collidepoint(mouse_pos),
+        )
+        self._draw_button(
+            self.ar_window_plus_btn,
+            "+",
+            self.ar_window_plus_btn.collidepoint(mouse_pos),
+        )
+        ar_value = self.font.render(str(self._draft_ar_window), True, UI_TEXT)
+        ar_value_rect = ar_value.get_rect(center=(panel.centerx, self.ar_window_minus_btn.centery))
+        self.screen.blit(ar_value, ar_value_rect)
+
+        header = self.font_tiny.render("Loss term", True, UI_TEXT)
+        coeff_header = self.font_tiny.render("Coeff", True, UI_TEXT)
+        self.screen.blit(header, (panel.x + 16, panel.y + SETTINGS_TERMS_HEADER_DY))
+        self.screen.blit(coeff_header, (panel.x + 210, panel.y + SETTINGS_TERMS_HEADER_DY))
 
         for i, spec in enumerate(LOSS_TERMS):
             row_y = panel.y + SETTINGS_TERMS_ROW_DY + i * SETTINGS_LOSS_TERM_ROW_H
             enabled = self._draft_loss_terms.get(spec.key, True)
+            coeff = self._draft_loss_coeffs.get(spec.key, spec.default_coeff)
             name_surf = self.font_tiny.render(spec.label, True, UI_TEXT)
-            self.screen.blit(name_surf, (panel.x + 16, row_y + 6))
+            self.screen.blit(name_surf, (panel.x + 16, row_y + 12))
+            minus_rect = self.loss_term_coeff_minus_btns[spec.key]
+            plus_rect = self.loss_term_coeff_plus_btns[spec.key]
+            self._draw_button(minus_rect, "-", minus_rect.collidepoint(mouse_pos))
+            self._draw_button(plus_rect, "+", plus_rect.collidepoint(mouse_pos))
+            coeff_surf = self.font_tiny.render(self._format_loss_coeff(coeff), True, UI_TEXT)
+            coeff_rect = coeff_surf.get_rect(center=(panel.x + 232, row_y + 22))
+            self.screen.blit(coeff_surf, coeff_rect)
             toggle_rect = self.loss_term_toggle_btns[spec.key]
             self._draw_button(
                 toggle_rect,
@@ -581,16 +707,40 @@ class Visualizer:
         self._draw_button(self.settings_save_btn, "Save", self.settings_save_btn.collidepoint(mouse_pos))
         self._draw_button(self.settings_close_btn, "Close", self.settings_close_btn.collidepoint(mouse_pos))
 
+    def _format_loss_coeff(self, value: float) -> str:
+        if value >= 1000 or (0 < value < 0.01):
+            return f"{value:.3g}"
+        if value >= 100:
+            return f"{value:.0f}"
+        if value >= 10:
+            return f"{value:.1f}"
+        return f"{value:.3g}"
+
+    def _adjust_coeff_draft(self, key: str, direction: int) -> None:
+        current = self._draft_loss_coeffs.get(key, 1.0)
+        factor = COEFF_STEP_FACTOR if direction > 0 else 1.0 / COEFF_STEP_FACTOR
+        self._draft_loss_coeffs[key] = max(MIN_LOSS_COEFF, min(MAX_LOSS_COEFF, current * factor))
+
+    def _adjust_ar_window_draft(self, delta: int) -> None:
+        self._draft_ar_window = max(
+            MIN_AUTOREGRESSIVE_WINDOW,
+            min(MAX_AUTOREGRESSIVE_WINDOW, self._draft_ar_window + delta),
+        )
+
     def _open_settings(self) -> None:
         self.show_settings = True
         self._draft_refresh_sec = self.settings_store.checkpoint_refresh_sec()
+        self._draft_ar_window = self.settings_store.autoregressive_window()
         self._draft_loss_terms = self.settings_store.loss_terms_enabled()
+        self._draft_loss_coeffs = normalize_loss_coeffs(self.settings_store.loss_coeffs())
         self._layout_settings_panel()
 
     def _close_settings(self) -> None:
         self.show_settings = False
         self._draft_refresh_sec = self.settings_store.checkpoint_refresh_sec()
+        self._draft_ar_window = self.settings_store.autoregressive_window()
         self._draft_loss_terms = self.settings_store.loss_terms_enabled()
+        self._draft_loss_coeffs = normalize_loss_coeffs(self.settings_store.loss_coeffs())
 
     def _adjust_refresh_draft(self, delta: float) -> None:
         self._draft_refresh_sec = max(
@@ -600,8 +750,12 @@ class Visualizer:
 
     def _save_settings(self) -> None:
         self.settings_store.save(
-            {"checkpoint_refresh_sec": self._draft_refresh_sec},
+            {
+                "checkpoint_refresh_sec": self._draft_refresh_sec,
+                "autoregressive_window": float(self._draft_ar_window),
+            },
             loss_terms=self._draft_loss_terms,
+            loss_coeffs=normalize_loss_coeffs(self._draft_loss_coeffs),
         )
         self._checkpoint_timer_ms = 0
         self.show_settings = False
@@ -637,13 +791,28 @@ class Visualizer:
         except OSError:
             return 0.0
 
+    def _recover_sim_pose(self) -> None:
+        self.sim.reset_pose()
+        self._reset_slide_history()
+
     def step_simulation(self) -> None:
         if self.sim.finished:
             return
+        if not limb_state_finite(self.sim.current_limbs) or not limb_state_finite(self.sim.previous_limbs):
+            self._recover_sim_pose()
+            return
         agent_input = self.sim.build_agent_input()
+        if not agent_input_finite(agent_input):
+            self._recover_sim_pose()
+            return
         output = self.agent.predict(agent_input)
+        if not agent_output_finite(output):
+            self._recover_sim_pose()
+            return
         self._record_pinned_foot_slide(output)
         self.sim.apply_agent_output(output)
+        if not limb_state_finite(self.sim.current_limbs):
+            self._recover_sim_pose()
 
     def handle_loop(self) -> None:
         self.sim.reset()
@@ -651,6 +820,10 @@ class Visualizer:
 
     def _experiment_active(self) -> bool:
         return self.experiment_runner is not None
+
+    def _enabled_loss_terms(self) -> tuple:
+        enabled = self.settings_store.loss_terms_enabled()
+        return tuple(spec for spec in LOSS_TERMS if enabled.get(spec.key, True))
 
     def _launch_experiment(self, fresh: bool = True) -> None:
         import shutil
@@ -706,6 +879,7 @@ class Visualizer:
     def handle_reset(self) -> None:
         self.sim.reset()
         self._reset_slide_history()
+        self._reset_view()
         if not self._experiment_active():
             self.agent.reinit_weights(seed=self.seed)
         elif self.checkpoint_dir:
@@ -721,6 +895,12 @@ class Visualizer:
         if self.refresh_plus_btn.collidepoint(pos):
             self._adjust_refresh_draft(REFRESH_STEP_SEC)
             return True
+        if self.ar_window_minus_btn.collidepoint(pos):
+            self._adjust_ar_window_draft(-1)
+            return True
+        if self.ar_window_plus_btn.collidepoint(pos):
+            self._adjust_ar_window_draft(1)
+            return True
         if self.settings_save_btn.collidepoint(pos):
             self._save_settings()
             return True
@@ -728,21 +908,34 @@ class Visualizer:
             if rect.collidepoint(pos):
                 self._draft_loss_terms[key] = not self._draft_loss_terms.get(key, True)
                 return True
+        for key, rect in self.loss_term_coeff_minus_btns.items():
+            if rect.collidepoint(pos):
+                self._adjust_coeff_draft(key, -1)
+                return True
+        for key, rect in self.loss_term_coeff_plus_btns.items():
+            if rect.collidepoint(pos):
+                self._adjust_coeff_draft(key, 1)
+                return True
         if self.settings_close_btn.collidepoint(pos):
             self._close_settings()
             return True
         return False
 
+    def _request_exit(self) -> None:
+        self._user_requested_exit = True
+        viz_shutdown.mark()
+        self.running = False
+
     def handle_events(self) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                self.running = False
+                self._request_exit()
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     if self.show_settings:
                         self._close_settings()
                     else:
-                        self.running = False
+                        self._request_exit()
                 elif event.key == pygame.K_SPACE and not self.show_settings:
                     self.paused = not self.paused
                 elif event.key == pygame.K_r and not self.show_settings:
@@ -769,6 +962,10 @@ class Visualizer:
                     self.handle_experiment_reset()
                 elif self.reset_button.collidepoint(event.pos):
                     self.handle_reset()
+            elif event.type == pygame.MOUSEWHEEL and not self.show_settings:
+                focus = pygame.mouse.get_pos()
+                if self._scroll_zoom_allowed(focus):
+                    self._adjust_zoom(event.y, focus)
 
     def run(self) -> None:
         try:
@@ -804,10 +1001,11 @@ class Visualizer:
                 self.render_frame()
         finally:
             if self.experiment_runner is not None:
-                self.experiment_runner.stop()
+                self.experiment_runner.stop(join=not self._user_requested_exit)
 
-        pygame.display.quit()
-        pygame.font.quit()
+        pygame.quit()
+        if self._user_requested_exit:
+            sys.exit(0)
 
 
 def main(

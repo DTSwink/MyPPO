@@ -49,9 +49,9 @@ class ExperimentRunner:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 5.0, *, join: bool = True) -> None:
         self._stop_event.set()
-        if self._thread is not None and self._thread.is_alive():
+        if join and self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=timeout)
         self._thread = None
 

@@ -58,6 +58,15 @@ class BatchEnv:
         self.frame_idx.zero_()
         self._randomize_limbs(torch.arange(self.batch_size, device=self.device))
 
+    def reset_poses(self, env_ids: torch.Tensor | None = None) -> None:
+        """Resample limb poses without rewinding the root trajectory."""
+        if env_ids is None:
+            env_ids = torch.arange(self.batch_size, device=self.device)
+        self._randomize_limbs(env_ids)
+
+    def poses_finite(self) -> bool:
+        return bool(torch.isfinite(self.current_limbs).all().item())
+
     def _randomize_limbs(self, env_ids: torch.Tensor) -> None:
         n = env_ids.shape[0]
         if n == 0:
@@ -66,25 +75,38 @@ class BatchEnv:
         self.current_limbs[env_ids, :, 2] = torch.empty(n, 3, device=self.device).uniform_(-math.pi, math.pi)
         self.previous_limbs[env_ids] = self.current_limbs[env_ids].clone()
 
-    def build_obs(self) -> torch.Tensor:
-        future = self.future_table[self.frame_idx]
+    def build_obs_from(
+        self,
+        frame_idx: torch.Tensor,
+        current_limbs: torch.Tensor,
+        previous_limbs: torch.Tensor,
+    ) -> torch.Tensor:
+        future = self.future_table[frame_idx]
         return torch.cat(
             [
                 future.reshape(self.batch_size, -1),
-                self.current_limbs.reshape(self.batch_size, -1),
-                self.previous_limbs.reshape(self.batch_size, -1),
+                current_limbs.reshape(self.batch_size, -1),
+                previous_limbs.reshape(self.batch_size, -1),
             ],
             dim=-1,
         )
 
-    def pinned_foot_velocity_loss(self, action: torch.Tensor) -> torch.Tensor:
+    def build_obs(self) -> torch.Tensor:
+        return self.build_obs_from(self.frame_idx, self.current_limbs, self.previous_limbs)
+
+    def pinned_foot_velocity_loss_at(
+        self,
+        frame_idx: torch.Tensor,
+        current_limbs: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
         """Penalize global velocity of the pinned (lower height) foot."""
-        root_curr = self.roots[self.frame_idx]
-        next_idx = torch.clamp(self.frame_idx + 1, max=self.n_roots - 1)
+        root_curr = self.roots[frame_idx]
+        next_idx = torch.clamp(frame_idx + 1, max=self.n_roots - 1)
         root_next = self.roots[next_idx]
 
-        curr_left = self.current_limbs[:, 1, :2]
-        curr_right = self.current_limbs[:, 2, :2]
+        curr_left = current_limbs[:, 1, :2]
+        curr_right = current_limbs[:, 2, :2]
         next_limbs = action[:, :9].reshape(self.batch_size, 3, 3)
         next_left = next_limbs[:, 1, :2]
         next_right = next_limbs[:, 2, :2]
@@ -102,6 +124,45 @@ class BatchEnv:
         left_pinned = left_h <= right_h
         pinned_vel_sq = torch.where(left_pinned, vel_left_sq, vel_right_sq)
         return pinned_vel_sq.mean()
+
+    def pinned_foot_velocity_loss(self, action: torch.Tensor) -> torch.Tensor:
+        return self.pinned_foot_velocity_loss_at(self.frame_idx, self.current_limbs, action)
+
+    def unpinned_foot_stride_loss_at(
+        self,
+        frame_idx: torch.Tensor,
+        current_limbs: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Penalize unpinned foot global step deviating from 2x root motion."""
+        root_curr = self.roots[frame_idx]
+        next_idx = torch.clamp(frame_idx + 1, max=self.n_roots - 1)
+        root_next = self.roots[next_idx]
+        target_disp = 2.0 * (root_next[:, :2] - root_curr[:, :2])
+
+        curr_left = current_limbs[:, 1, :2]
+        curr_right = current_limbs[:, 2, :2]
+        next_limbs = action[:, :9].reshape(self.batch_size, 3, 3)
+        next_left = next_limbs[:, 1, :2]
+        next_right = next_limbs[:, 2, :2]
+
+        g_curr_left = batch_local_xy_to_global(root_curr, curr_left)
+        g_curr_right = batch_local_xy_to_global(root_curr, curr_right)
+        g_next_left = batch_local_xy_to_global(root_next, next_left)
+        g_next_right = batch_local_xy_to_global(root_next, next_right)
+
+        err_left = g_next_left - g_curr_left - target_disp
+        err_right = g_next_right - g_curr_right - target_disp
+        err_left_sq = (err_left * err_left).sum(dim=-1)
+        err_right_sq = (err_right * err_right).sum(dim=-1)
+
+        left_h = action[:, 9]
+        right_h = action[:, 10]
+        left_pinned = left_h <= right_h
+        return torch.where(left_pinned, err_right_sq, err_left_sq).mean()
+
+    def unpinned_foot_stride_loss(self, action: torch.Tensor) -> torch.Tensor:
+        return self.unpinned_foot_stride_loss_at(self.frame_idx, self.current_limbs, action)
 
     def step(self, action: torch.Tensor) -> None:
         action = action.detach()

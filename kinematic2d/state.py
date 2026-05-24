@@ -59,6 +59,50 @@ def random_limb_state(rng: np.random.Generator | None = None) -> LimbState:
     )
 
 
+def _transform_finite(tf: Transform2D) -> bool:
+    return math.isfinite(tf.x) and math.isfinite(tf.y) and math.isfinite(tf.angle)
+
+
+def limb_state_finite(limbs: LimbState) -> bool:
+    if not _transform_finite(limbs.pelvis):
+        return False
+    if not _transform_finite(limbs.foot_left):
+        return False
+    if not _transform_finite(limbs.foot_right):
+        return False
+    return all(
+        math.isfinite(value)
+        for value in (
+            limbs.foot_left_height,
+            limbs.foot_right_height,
+            limbs.prev_foot_left_height,
+            limbs.prev_foot_right_height,
+        )
+    )
+
+
+def agent_output_finite(output: dict[str, np.ndarray]) -> bool:
+    if not np.isfinite(output["future_limbs"]).all():
+        return False
+    for key in (
+        "foot_left_height",
+        "foot_right_height",
+        "prev_foot_left_height",
+        "prev_foot_right_height",
+    ):
+        if not math.isfinite(float(output[key])):
+            return False
+    return True
+
+
+def agent_input_finite(agent_input: dict[str, np.ndarray]) -> bool:
+    return (
+        np.isfinite(agent_input["future_roots"]).all()
+        and np.isfinite(agent_input["current_limbs"]).all()
+        and np.isfinite(agent_input["previous_limbs"]).all()
+    )
+
+
 @dataclass
 class Simulation:
     roots: list[Transform2D]
@@ -90,6 +134,11 @@ class Simulation:
 
     def reset(self) -> None:
         self.frame_index = 0
+        self.current_limbs = random_limb_state(self._rng)
+        self.previous_limbs = random_limb_state(self._rng)
+
+    def reset_pose(self) -> None:
+        """Resample limb poses at the current frame (keep frame index)."""
         self.current_limbs = random_limb_state(self._rng)
         self.previous_limbs = random_limb_state(self._rng)
 

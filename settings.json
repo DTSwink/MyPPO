@@ -1,9 +1,17 @@
 {
-  "checkpoint_refresh_sec": 2.0,
+  "checkpoint_refresh_sec": 1.0,
+  "autoregressive_window": 32,
   "loss_terms": {
     "pelvis_tilt": true,
     "foot_pin": true,
-    "limb_radius": true
+    "limb_radius": true,
+    "foot_stride": false
+  },
+  "loss_coeffs": {
+    "pelvis_tilt": 1.0,
+    "foot_pin": 35.18437208883202,
+    "limb_radius": 64.0,
+    "foot_stride": 209.71520000000007
   },
   "experiment": {
     "checkpoint_dir": "checkpoints/live",

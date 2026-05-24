@@ -1,0 +1,34 @@
+# Model checkpoints and training artifacts
+checkpoints/
+
+# Checkpoint atomic-write staging files (if outside checkpoints/)
+**/_latest_staging.npz
+**/_metrics_staging.json
+
+# Local runtime / user session
+.viz_user_closed
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS & editors
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
